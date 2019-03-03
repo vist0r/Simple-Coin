@@ -1,35 +1,70 @@
 import socket
 import leveldb
-import demjson
 import threading
+import struct
+import pickle
 from uuid import uuid4
+
+from ECCSign import *
 from block_chain import *
+from config_handler import load_config
+
 
 BUF_SIZE = 1024 * 256
-HOST = '127.0.0.1'
-PORT = 4999
-TAIL = '\r\n'
+HOST = load_config('P2P_HOST')
+PORT = load_config('P2P_LISTENING_PORT')
 LOCK = threading.Lock()
 NOW = None
 db = None
+tdb = None
+ndb = None
+
 FIND_NEW_BLOCK = threading.Event()
 BOARDCAST_EVENT = threading.Event()
 SYNC_FINISH_EVENT = threading.Event()
+MINER_ADDRESS = None
 
 generate_minerid = lambda: str(uuid4())
+generate_trxid = lambda: uuid4().hex
 MINER_ID = generate_minerid()
+MINER_ADDRESS = "1G1NpejXSEtfpeR3E9qqmvs2hTX4tLMbSH"
 CON = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
 CON.connect((HOST, PORT))
-hello = str(demjson.encode({'type': 'add_miner', 'miner_id': f'{MINER_ID}'})) + TAIL
-CON.send(hello.encode())
-sync_chain = str(demjson.encode({'type': 'sync_chain_request_byMiner', 'miner_id': f'{MINER_ID}'})) + TAIL
-CON.send(sync_chain.encode())
+
+
+def sendLine(data):
+    header = struct.pack("!1I", data.__len__())
+    return header + data
+
+
+hello = str(demjson.encode({'type': 'add_miner', 'miner_id': f'{MINER_ID}'}))
+CON.send(sendLine(hello.encode()))
+
+sync_chain = str(demjson.encode({'type': 'sync_chain_request_byMiner', 'miner_id': f'{MINER_ID}'})).encode()
+
+CON.send(sendLine(sync_chain))
 
 
 def creat_leveldb():
     while True:
         try:
-            return leveldb.LevelDB('./chain.db')
+            return leveldb.LevelDB(load_config('CHAIN_DB'))
+        except:
+            pass
+
+
+def creat_trxdb():
+    while True:
+        try:
+            return leveldb.LevelDB(load_config('TRANSACTION_POOL_DB'))
+        except:
+            pass
+
+
+def creat_book():
+    while True:
+        try:
+            return leveldb.LevelDB(load_config('BOOK_DB'))
         except:
             pass
 
@@ -56,7 +91,7 @@ def init_chain(skip=False):
         return
     except:
         pass
-    Creation_block = Block(0, 0, 0, 0)
+    Creation_block = Block(0, 0, 0, 0,[])
     NOW = Creation_block
     index = str(Creation_block.id).encode()
     block = pickle.dumps(Creation_block)
@@ -65,13 +100,39 @@ def init_chain(skip=False):
     print('Initialization successful!')
 
 
+def check_trx(block):
+    num = 0
+    for trx in block.current_transaction:
+        if trx['_from'] == '0':
+            num += 1
+            if num > 1:
+                return False
+            if trx['asset'] != 5000000000:
+                return False
+    return True
+
+
 def check_valid(chain):
-    Last_block = Block(chain[0]['id'], chain[0]['proof'], chain[0]['pre_hash'],chain[0]['timestamp'])
-    Last_block.current_transaction = chain[0]['current_transaction']
+    Last_block = Block(
+        chain[0]['id'],
+        chain[0]['proof'],
+        chain[0]['pre_hash'],
+        chain[0]['timestamp'],
+        chain[0]['current_transaction']
+    )
+    if check_trx(Last_block) is False:
+        return False
     index = 1
     while index < len(chain):
-        block = Block(chain[index]['id'], chain[index]['proof'], chain[index]['pre_hash'],chain[index]['timestamp'])
-        block.current_transaction = chain[index]['current_transaction']
+        block = Block(
+            chain[index]['id'],
+            chain[index]['proof'],
+            chain[index]['pre_hash'],
+            chain[index]['timestamp'],
+            chain[index]['current_transaction']
+        )
+        if check_trx(block) is False:
+            return False
         if block.pre_hash != hash(Last_block):
             print("Block.pre_hash != Hash(Last_block)")
             print(Last_block.__dict__)
@@ -96,6 +157,7 @@ def dict_block(block):
 
 
 def resolve_conflicts(db, chain):
+    global NOW
     # print(chain)
     if (int(chain[-1]['id']) <= int(NOW.id)):
         print("The NEW CHAIN IS SHORT THEN THIS CHAIN ", chain[-1]['id'], '  ', NOW.id)
@@ -114,10 +176,19 @@ def resolve_conflicts(db, chain):
     pre_id = int(pickle.loads(db.Get(str(chain[0]['id']).encode())).id) - 1
     last_block = pickle.loads(db.Get(str(pre_id).encode()))
     if hash(last_block) != chain[0]['pre_hash']:
+        print('IN THERE')
+        #print(last_block.__dict__)
+        #print(chain[0]['pre_hash'])
+        with open('error_log1.json','w') as f:
+            f.write(demjson.encode(last_block.__dict__))
+        with open('error_log2.json','w') as f:
+            f.write(chain[0]['pre_hash'])
         print("HASH NOT EQUAL")
+        exit(-1)
         return False
     if not valid_proof(last_block.proof, chain[0]['proof']):
         print("PROOF INVALID")
+        exit(-1)
         return False
     return True
 
@@ -139,10 +210,16 @@ def check_all(db):
     NOW = last_block
     if block != None:
         NOW = block
+        print('NOWb = ', NOW.__dict__)
     while block:
         if block.pre_hash != hash(last_block):
+            print(block.__dict__)
+            print(last_block.__dict__)
+            print(hash(last_block))
+            print('block !hash')
             return False
         if not valid_proof(last_block.proof, block.proof):
+            print('invalid_proof')
             return False
         last_block = block
         index += 1
@@ -156,99 +233,229 @@ def mining(newblock_event, boardcast_event, sync_finish_event):
     print('Sync_chain...')
     while not sync_finish_event.is_set():
         pass
-    global NOW, db
+    global NOW, db, tdb, ndb
     proof = random.randint(0, 2 ** 256)
     while True:
         ans = False
         print('Mining Block id = ', NOW.id)
         while True:
-            try:
+            if newblock_event.is_set():
+                newblock_event.clear()
+                print('There is new chain!')
+                break
+            if (valid_proof(NOW.proof, proof) is False):
+                proof = random.randint(0, 2 ** 256)
+            else:
                 if newblock_event.is_set():
                     newblock_event.clear()
                     print('There is new chain!')
                     break
-            except:
-                pass
-
-            if (valid_proof(NOW.proof, proof) is False):
-                proof = random.randint(0, 2 ** 64)
-            else:
                 ans = True
                 break
         if ans is True:
             LOCK.acquire()
+            if not valid_proof(NOW.proof,proof):
+                continue
             db = creat_leveldb()
-            new_block = Block(NOW.id + 1, proof, hash(NOW),int(time()))
+            tdb = creat_trxdb()
+            ndb = creat_book()
+            #print('NOW hash = ', hash(NOW), ' ', NOW.__dict__)
+            new_block = Block(NOW.id + 1, proof, hash(NOW), int(time()), [])
+            reward = Transaction(generate_trxid(), '0', MINER_ADDRESS, 5000000000, new_block.timestamp).__dict__
+            new_block.current_transaction.append(reward)
+            for id, trx in tdb.RangeIter():
+                transaction = pickle.loads(trx).__dict__
+                new_block.current_transaction.append(transaction)
+                tdb.Delete(id)
             NOW = new_block
-            print('New Block Created! ', new_block.id, ' ', new_block.proof, ' ', new_block.pre_hash)
             db.Put(str(new_block.id).encode(), pickle.dumps(new_block))
+            if NOW.id - 6 >= 0:
+                trx_block = db.Get(str(NOW.id - 6).encode())
+                trx_block = pickle.loads(trx_block)
+                trx_list = trx_block.current_transaction
+                for trx in trx_list:
+                    try:
+                        f_amount = int(ndb.Get(trx['_from'].encode()).decode())
+                    except:
+                        ndb.Put(trx['_from'].encode(), b'0')
+                        f_amount = 0
+
+                    try:
+                        t_amount = int(ndb.Get(trx['to'].encode()).decode())
+                    except:
+                        ndb.Put(trx['to'].encode(), b'0')
+                        t_amount = 0
+
+                    if trx['_from'] == '0':
+                        t_amount += int(trx['asset'])
+                        ndb.Put(trx['to'].encode(), str(t_amount).encode())
+
+                    if int(trx['asset']) > 0 and f_amount - int(trx['asset']) >= 0:
+                        f_amount -= int(trx['asset'])
+                        t_amount += int(trx['asset'])
+                        ndb.Put(trx['_from'].encode(), str(f_amount).encode())
+                        ndb.Put(trx['to'].encode(), str(t_amount).encode())
             db = None
-            LOCK.release()
+            tdb = None
+            ndb = None
             boardcast_event.set()
+            LOCK.release()
+
+
+def data_handle(data, newblock_event, sync_finish_event):
+    global NOW, db, CON, tdb, ndb
+    data = demjson.decode(data)
+    if data['type'] == 'sync_finish':
+        print('Sync chain finished,Begin to check valid')
+        LOCK.acquire()
+        db = creat_leveldb()
+        reslut = check_all(db)
+        db = None
+        if reslut:
+            print('Vaild chain! Begin minning')
+            init_chain(skip=True)
+        else:
+            print('Not valid chain,Begin to init chain ....')
+            init_chain()
+        sync_finish_event.set()
+        LOCK.release()
+    if not sync_finish_event.is_set():
+        return
+    if data['type'] == 'new_block':
+        LOCK.acquire()
+        chain = data['data']
+        db = creat_leveldb()
+        tdb = creat_trxdb()
+        ndb = creat_book()
+        solved = resolve_conflicts(db, chain)
+        if solved:
+            newblock_event.set()
+            for block in chain:
+                new_block = Block(
+                    block['id'],
+                    block['proof'],
+                    block['pre_hash'],
+                    block['timestamp'],
+                    block['current_transaction']
+                )
+                try:
+                    old_block = db.Get(str(block['id']).encode())
+                    old_block = pickle.loads(old_block)
+                    for trx in old_block.current_transaction:
+                        if trx['_from'] == '0':
+                            continue
+                        _trx = Transaction(trx['trx_id'], trx['_from'], trx['to'], trx['asset'], trx['timestamp'])
+                        tdb.Put(trx['trx_id'].encode(), pickle.dumps(_trx))
+                    for trx in block['current_transaction']:
+                        try:
+                            tdb.Get(trx['trx_id'].encode())
+                            tdb.Delete(trx['trx_id'].encode())
+                        except KeyError:
+                           pass
+                except KeyError:
+                    pass
+
+                NOW = new_block
+                db.Put(str(NOW.id).encode(), pickle.dumps(NOW))
+                # TODO update comfirmed transcation
+            if NOW.id - 6 >= 0:
+                trx_block = db.Get(str(NOW.id - 6).encode())
+                trx_block = pickle.loads(trx_block)
+                trx_list = trx_block.current_transaction
+                for trx in trx_list:
+                    try:
+                        f_amount = int(ndb.Get(trx['_from'].encode()).decode())
+                    except:
+                        ndb.Put(trx['_from'].encode(), b'0')
+                        f_amount = 0
+
+                    try:
+                        t_amount = int(ndb.Get(trx['to'].encode()).decode())
+                    except:
+                        ndb.Put(trx['to'].encode(), b'0')
+                        t_amount = 0
+
+                    if trx['_from'] == '0':
+                        t_amount += int(trx['asset'])
+                        ndb.Put(trx['to'].encode(), str(t_amount).encode())
+
+                    if f_amount - int(trx['asset']) >= 0:
+                        f_amount -= int(trx['asset'])
+                        t_amount += int(trx['asset'])
+                        ndb.Put(trx['_from'].encode(), str(f_amount).encode())
+                        ndb.Put(trx['to'].encode(), str(t_amount).encode())
+            print(f'Other Node Solve The Promble ,Merged Chain :{NOW.id}')
+
+        db = None
+        tdb = None
+        ndb = None
+        LOCK.release()
+    if data['type'] == 'transaction':
+        LOCK.acquire()
+        print('Recived an transaction! :', data)
+        _trx = data['data']
+        trx = Transaction(_trx['trx_id'], _trx['_from'], _trx['to'], _trx['asset'], _trx['timestamp'])
+        if not (trx.asset > 0 and trx._from - trx.asset >= 0):
+            print('Not valid !')
+            return
+        print('sign data:',data)
+        signature = data['sign']
+        if verify_sign(demjson.encode(trx.__dict__), signature, trx._from):
+            print('OK,valid signature')
+            tdb = creat_trxdb()
+            tdb.Put(trx.trx_id.encode(), pickle.dumps(trx))
+            tdb = None
+            print('write Done!')
+        LOCK.release()
 
 
 def listener(newblock_event, sync_finish_event):
-    global NOW, db, CON
+    global NOW, db, CON, tdb, ndb
+    dataBuffer = bytes()
+    headerSize = 4
     while True:
         data = CON.recv(BUF_SIZE)
         if not data:
             print('Connection Losed!')
             break
-
-        data = demjson.decode(data)
-        if (data['type'] == 'sync_finish'):
-            print('Sync chain finished,Begin to check valid')
-            LOCK.acquire()
-            db = creat_leveldb()
-            reslut = check_all(db)
-            db = None
-            if reslut:
-                print('Vaild chain! Begin minning')
-                init_chain(skip=True)
-            else:
-                print('Not valid chain,Begin to init chain ....')
-                init_chain()
-            sync_finish_event.set()
-            LOCK.release()
-
-        if not sync_finish_event:
-            continue
-
-        if (data['type'] == 'new_block'):
-            chain = sorted(data['data'], key=lambda x: x['id'])
-            LOCK.acquire()
-            db = creat_leveldb()
-            solved = resolve_conflicts(db, chain)
-            if solved:
-                for block in chain:
-                    new_block = Block(block['id'], block['proof'], block['pre_hash'],block['timestamp'])
-                    NOW = new_block
-                    db.Put(str(NOW.id).encode(), pickle.dumps(NOW))
-                    # TODO update comfirmed transcation
-                print(f'Other Node Solve The Promble ,Merged Chain :{NOW.id}')
-                newblock_event.set()
-            db = None
-            LOCK.release()
+        dataBuffer += data
+        while True:
+            if len(dataBuffer) < headerSize:
+                break
+            bodySize = struct.unpack('!1I', dataBuffer[:headerSize])[0]
+            if len(dataBuffer) < headerSize + bodySize:
+                break
+            body = dataBuffer[headerSize:headerSize + bodySize]
+            data_handle(body,newblock_event,sync_finish_event)
+            dataBuffer = dataBuffer[headerSize + bodySize:]
 
 
 def speaker(boardcast_event):
     global NOW, db, CON
     while True:
         if boardcast_event.is_set():
+            LOCK.acquire()
             begin = max(0, NOW.id - 5)
             end = NOW.id
             chain = Msg('new_block')
-            LOCK.acquire()
             db = creat_leveldb()
             for id in range(begin, end + 1):
-                block = db.Get(str(id).encode())
-                Block = pickle.loads(block)
-                chain.data.append(dict_block(Block))
+                flag = True
+                while flag:
+                    try:
+                        block = db.Get(str(id).encode())
+                        Block = pickle.loads(block)
+                        chain.data.append(dict_block(Block))
+                        flag = False
+                    except:
+                        pass
+
             db = None
-            LOCK.release()
-            chain_json = (str(demjson.encode(dict_chain(chain))) + TAIL).encode()
-            CON.send(chain_json)
+            chain_json = (str(demjson.encode(dict_chain(chain)))).encode()
+            data = sendLine(chain_json)
+            CON.send(data)
             boardcast_event.clear()
+            LOCK.release()
 
 
 MINNING_THREAD = threading.Thread(target=mining, args=(FIND_NEW_BLOCK, BOARDCAST_EVENT, SYNC_FINISH_EVENT),

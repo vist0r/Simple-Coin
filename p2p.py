@@ -1,5 +1,6 @@
 import random
 import pickle
+import struct
 import demjson
 import leveldb
 import threading
@@ -12,10 +13,14 @@ from twisted.internet.protocol import Factory
 from twisted.internet.endpoints import TCP4ServerEndpoint
 from twisted.internet.endpoints import TCP4ClientEndpoint, connectProtocol
 
-LISTENING_PORT = 4999
-CONNECTION_PORT = 5999
-HOST = "127.0.0.1"
+from config_handler import load_config
+
+LISTENING_PORT = load_config('P2P_LISTENING_PORT')
+CONNECTION_PORT = load_config('P2P_CONNECTION_PORT')
+HOST = load_config('P2P_HOST')
 db = None
+ndb = None
+tlog = None
 
 generate_nodeid = lambda: str(uuid4())
 LOCK = threading.Lock()
@@ -26,25 +31,37 @@ HEAD = None
 def creat_leveldb():
     while True:
         try:
-            return leveldb.LevelDB('./chain.db')
+            return leveldb.LevelDB(load_config('CHAIN_DB'))
         except:
             pass
 
 
-def get_block(id):
-    global db
-    try:
-        return pickle.loads(db.Get(str(id).encode()))
-    except:
-        return Block(-1, 0, 0,0)
+def creat_book():
+    while True:
+        try:
+            return leveldb.LevelDB(load_config('BOOK_DB'))
+        except:
+            pass
 
 
-def get_head():
-    global  db
-    index = 0
-    while get_block(index + 1).id != -1:
-        index += 1
-    return get_block(index)
+def creat_tlog():
+    while True:
+        try:
+            return leveldb.LevelDB(load_config('TRANSACTION_LOG'))
+        except:
+            pass
+
+
+def do_send(conn, data):
+    header = struct.pack("!1I", data.__len__())
+    conn.transport.write(header + data)
+
+
+class book(object):
+    def __init__(self, type, add, asset):
+        self.type = type
+        self.address = add
+        self.asset = asset
 
 
 class Msg(object):
@@ -56,7 +73,7 @@ class Msg(object):
 
 
 class Block(object):
-    def __init__(self, id, proof, pre_hash,timestamp):
+    def __init__(self, id, proof, pre_hash, timestamp):
         self.id = id
         self.current_transaction = []
         self.proof = proof
@@ -71,8 +88,8 @@ class MyProtocol(LineReceiver):
         self.remote_nodeid = None
         self.last_ping = 0
         self.lc_ping = LoopingCall(self.send_ping)
-        self.talkingport = 0
         self.miner_id = None
+        self._data_buffer = bytes()
 
     def connectionMade(self):
         LineReceiver.connectionMade(self)
@@ -106,9 +123,10 @@ class MyProtocol(LineReceiver):
         else:
             print(self.nodeid, 'disconnected')
 
-    def lineReceived(self, data):
-        remote = self.transport.getPeer()
-        host = self.transport.getHost()
+    def sendLine(self, data):
+        do_send(self, data)
+
+    def data_handle(self, data):
         data = demjson.decode(data)
         if data['type'] == 'connected':
             self.handle_hello(data)
@@ -120,16 +138,61 @@ class MyProtocol(LineReceiver):
             self.handle_addr(data)
         if data['type'] == 'boardcast':
             self.handle_boardcast(data)
-        if (data['type'] == 'add_miner'):
+        if data['type'] == 'add_miner':
             self.handle_add_miner(data)
-        if (data['type'] == 'new_block'):
+        if data['type'] == 'new_block':
             self.handle_newblock(data)
-        if (data['type'] == 'sync_chain_request_byMiner'):
+        if data['type'] == 'sync_chain_request_byMiner':
             self.handle_sync_chain_request_byMiner()
-        if (data['type'] == 'sync_chain_request_byNode'):
+        if data['type'] == 'sync_chain_request_byNode':
             self.handle_sync_chain_request_byNode()
-        if (data['type'] == 'sync_chain'):
+        if data['type'] == 'sync_chain':
             self.handle_sync_chain(data)
+        if data['type'] == 'transaction':
+            self.handle_transaction(data)
+        if data['type'] == 'asset':
+            self.handle_asset(data)
+
+    def dataReceived(self, data):
+        self._data_buffer += data
+        headerSize = 4
+        while True:
+            if len(self._data_buffer) < headerSize:
+                return
+            bodySize = struct.unpack('!1I', self._data_buffer[:headerSize])[0]
+            if len(self._data_buffer) < headerSize + bodySize:
+                return
+            body = self._data_buffer[headerSize:headerSize + bodySize]
+            # print(body)
+            self.data_handle(body)
+            self._data_buffer = self._data_buffer[headerSize + bodySize:]
+
+    def handle_asset(self, data):
+        global ndb
+        LOCK.acquire()
+        ndb = creat_book()
+        asset = ndb.Get(data['data'].encode()).decode()
+        msg = book('asset', data['data'], asset).__dict__
+        self.sendLine(demjson.encode(msg).encode())
+        ndb = None
+        LOCK.release()
+
+    def handle_transaction(self, data):
+        global tlog
+        LOCK.acquire()
+        try:
+            tlog = creat_tlog()
+            _trx = tlog.Get(data['data']['trx_id'].encode())
+        except:
+            trx = data['data']
+            self.handle_boardcast(data, type='transaction')
+            if trx['_from'] != '0':
+                for miner in self.factory.miner_nodes:
+                    _miner = self.factory.miner_nodes[miner]
+                    do_send(_miner, str(data).encode())
+        finally:
+            tlog = None
+            LOCK.release()
 
     def handle_sync_chain(self, data):
         global db, HEAD
@@ -140,7 +203,7 @@ class MyProtocol(LineReceiver):
         for index, jindex in db.RangeIter():
             i += 1
         if i == -1:
-            HEAD = Block(-1, 0, 0,0)
+            HEAD = Block(-1, 0, 0, 0)
         else:
             HEAD = pickle.loads(db.Get(str(i).encode()))
         print('data[stat] = ', data['stat'], ' ', HEAD.id)
@@ -150,13 +213,13 @@ class MyProtocol(LineReceiver):
                 for node in self.factory.miner_nodes:
                     _node = self.factory.miner_nodes[node]
                     msg = Msg('sync_finish').__dict__
-                    _node.sendLine(str(demjson.encode(msg)).encode())
+                    do_send(_node, str(demjson.encode(msg)).encode())
                     break
             db = None
             LOCK.release()
             return
         for block in chain:
-            _block = Block(block['id'], block['proof'], block['pre_hash'],block['timestamp'])
+            _block = Block(block['id'], block['proof'], block['pre_hash'], block['timestamp'])
             _block.current_transaction = block['current_transaction']
             db.Put(str(_block.id).encode(), pickle.dumps(_block))
         db = None
@@ -164,7 +227,7 @@ class MyProtocol(LineReceiver):
             for node in self.factory.miner_nodes:
                 _node = self.factory.miner_nodes[node]
                 msg = Msg('sync_finish').__dict__
-                _node.sendLine(str(demjson.encode(msg)).encode())
+                do_send(_node, str(demjson.encode(msg)).encode())
                 break
         LOCK.release()
 
@@ -179,7 +242,7 @@ class MyProtocol(LineReceiver):
         for node in self.factory.peers:
             _node = self.factory.peers[node]
             msg = demjson.encode(Msg('sync_chain_request_byNode').__dict__).encode()
-            _node.sendLine(msg)
+            do_send(_node, msg)
 
     def handle_sync_chain_request_byNode(self):
         global db, HEAD
@@ -187,10 +250,10 @@ class MyProtocol(LineReceiver):
         LOCK.acquire()
         db = creat_leveldb()
         i = -1
-        for index,jindex in db.RangeIter():
+        for index, jindex in db.RangeIter():
             i += 1
         if i == -1:
-            HEAD = Block(-1,0,0,0)
+            HEAD = Block(-1, 0, 0, 0)
         else:
             HEAD = pickle.loads(db.Get(str(i).encode()))
         num = 0
@@ -210,23 +273,35 @@ class MyProtocol(LineReceiver):
         chain.compelet = True
         print('db created')
         chain = chain.__dict__
+        print(chain)
         db = None
         self.sendLine(str(demjson.encode(chain)).encode())
         LOCK.release()
 
     def handle_newblock(self, data):
-        print('new_block_data: ', data)
-        self.handle_boardcast(data)
-        for miner in self.factory.miner_nodes:
-            _miner = self.factory.miner_nodes[miner]
-            _miner.sendLine(str(data).encode())
+        # print('new_block_data: ', data)
+        global db
+        LOCK.acquire()
+        try:
+            db = creat_tlog()
+            db.Get(data['data'][-1]['id'].encode())
+            print('Already Exist!')
+        except:
+            self.handle_boardcast(data, type='new_block')
+            for miner in self.factory.miner_nodes:
+                _miner = self.factory.miner_nodes[miner]
+                do_send(_miner, str(data).encode())
+        finally:
+            db = None
+            LOCK.release()
 
     def handle_add_miner(self, data):
         self.miner_id = data['miner_id']
         self.factory.miner_nodes[self.miner_id] = self
         print('new miner added!')
 
-    def handle_boardcast(self, rawdata):
+    def handle_boardcast(self, rawdata, type='boardcast'):
+        global db
         data = rawdata
         if isinstance(rawdata, str):
             data = eval(rawdata)
@@ -235,15 +310,30 @@ class MyProtocol(LineReceiver):
             tar_host = self.factory.peers[host].transport.getHost()
             from_ip = f'{tar_host.host}:{tar_host.port}'
             det_time = int(time()) - int(data['time'])
-            if str(data['_from']) != str(ip) and det_time < 2:
-                send_data = demjson.encode(
-                    {'type': data['type'],
-                     'data': data['data'],
-                     '_from': from_ip,
-                     'time': data['time']
-                     }
-                )
-                self.factory.peers[host].sendLine(send_data.encode())
+            if str(data['_from']) != str(ip):
+                if type == 'boardcast':
+                    if det_time < 3:
+                        send_data = demjson.encode(
+                            {
+                                'type': data['type'],
+                                'data': data['data'],
+                                '_from': from_ip,
+                                'time': data['time'],
+                                'sign': data['sign']
+                            }
+                        )
+                        do_send(self.factory.peers[host], send_data.encode())
+                else:
+                    send_data = demjson.encode(
+                        {
+                            'type': data['type'],
+                            'data': data['data'],
+                            '_from': from_ip,
+                            'time': data['time'],
+                            'sign': data['sign']
+                        }
+                    )
+                    do_send(self.factory.peers[host], send_data.encode())
 
     def handle_addr(self, data):
         list = data['data']
