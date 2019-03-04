@@ -255,6 +255,7 @@ def mining(newblock_event, boardcast_event, sync_finish_event):
         if ans is True:
             LOCK.acquire()
             if not valid_proof(NOW.proof,proof):
+                LOCK.release()
                 continue
             db = creat_leveldb()
             tdb = creat_trxdb()

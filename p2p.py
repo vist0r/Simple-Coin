@@ -273,7 +273,6 @@ class MyProtocol(LineReceiver):
         chain.compelet = True
         print('db created')
         chain = chain.__dict__
-        print(chain)
         db = None
         self.sendLine(str(demjson.encode(chain)).encode())
         LOCK.release()
